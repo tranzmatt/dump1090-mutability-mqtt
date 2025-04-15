@@ -16,8 +16,8 @@ endif
 
 CPPFLAGS+=-DMODES_DUMP1090_VERSION=\"$(DUMP1090_VERSION)\"
 CFLAGS+=-O2 -g -Wall -Werror -W
-LIBS=-lpthread -lm 
-LIBS_RTL=`pkg-config --libs librtlsdr libusb-1.0 libmosquitto`
+LIBS=-lpthread -lm -lmosquitto
+LIBS_RTL=`pkg-config --libs librtlsdr libusb-1.0`
 CC=gcc
 
 UNAME := $(shell uname)
@@ -50,10 +50,13 @@ all: dump1090 view1090
 
 dump1090.o: CFLAGS += `pkg-config --cflags librtlsdr libusb-1.0`
 
-dump1090: dump1090.o anet.o interactive.o mode_ac.o mode_s.o net_io.o crc.o demod_2400.o stats.o cpr.o icao_filter.o track.o util.o convert.o $(COMPAT)
+mqtt.o: mqtt.c mqtt.h
+	$(CC) $(CFLAGS) -c mqtt.c -o mqtt.o
+
+dump1090: dump1090.o mqtt.o anet.o interactive.o mode_ac.o mode_s.o net_io.o crc.o demod_2400.o stats.o cpr.o icao_filter.o track.o util.o convert.o $(COMPAT)
 	$(CC) -g -o $@ $^ $(LIBS) $(LIBS_RTL) $(LDFLAGS)
 
-view1090: view1090.o anet.o interactive.o mode_ac.o mode_s.o net_io.o crc.o stats.o cpr.o icao_filter.o track.o util.o $(COMPAT)
+view1090: view1090.o mqtt.o anet.o interactive.o mode_ac.o mode_s.o net_io.o crc.o stats.o cpr.o icao_filter.o track.o util.o $(COMPAT)
 	$(CC) -g -o $@ $^ $(LIBS) $(LDFLAGS)
 
 faup1090: faup1090.o anet.o mode_ac.o mode_s.o net_io.o crc.o stats.o cpr.o icao_filter.o track.o util.o $(COMPAT)

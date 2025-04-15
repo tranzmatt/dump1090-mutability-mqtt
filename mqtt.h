@@ -5,6 +5,10 @@
 extern "C" {
 #endif
 
+// Forward declaration of the modesMessage struct from dump1090.h
+// This avoids having to include the entire dump1090.h in this header
+struct modesMessage;
+
 // MQTT configuration structure.
 typedef struct {
     int enabled;            // Enable MQTT output if set to 1.
@@ -25,6 +29,10 @@ int mqtt_init(const mqtt_config_t *config);
 // Returns 0 on success or a nonzero error code if publishing fails.
 int mqtt_publish(const char *message);
 
+// Format and publish an ADS-B message to MQTT
+// This handles creating the JSON representation of the message
+void mqtt_publish_adsb_message(struct modesMessage *mm);
+
 // Clean up and disconnect the MQTT client.
 void mqtt_cleanup(void);
 
@@ -33,4 +41,3 @@ void mqtt_cleanup(void);
 #endif
 
 #endif // MQTT_H
-

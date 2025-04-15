@@ -47,13 +47,20 @@
 //   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 //   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
 #include "dump1090.h"
+#include "mqtt.h"
 
 #include <rtl-sdr.h>
 
-#include <stdarg.h>
+modes_s Modes;
 
 static int verbose_device_search(char *s);
+
+const char *addrtype_to_string(int addrtype);
 
 //
 // ============================= Utility functions ==========================
@@ -159,6 +166,15 @@ void modesInitConfig(void) {
     Modes.json_interval           = 1000;
     Modes.json_location_accuracy  = 1;
     Modes.maxRange                = 1852 * 300; // 300NM default max range
+    // MQTT configuration defaults
+    strcpy(Modes.mqtt_config.host, "localhost");
+    Modes.mqtt_config.port = 1883;
+    Modes.mqtt_config.username[0] = '\0';
+    Modes.mqtt_config.password[0] = '\0';
+    strcpy(Modes.mqtt_config.topic, "adsb/raw");
+    Modes.mqtt_config.use_tls = 0;
+    Modes.mqtt_config.ca_cert[0] = '\0';
+
 }
 //
 //=========================================================================
@@ -259,6 +275,17 @@ void modesInit(void) {
         if (!Modes.converter_function) {
             fprintf(stderr, "Can't initialize sample converter, giving up.\n");
             exit(1);
+        }
+    }
+        // Initialize MQTT if enabled
+    if (Modes.mqtt_config.enabled) {
+        if (mqtt_init(&Modes.mqtt_config) != 0) {
+            fprintf(stderr, "Failed to initialize MQTT connection\n");
+            // Continue anyway, just without MQTT
+            Modes.mqtt_config.enabled = 0;
+        } else {
+            fprintf(stderr, "MQTT connection initialized to %s:%d\n",
+                    Modes.mqtt_config.host, Modes.mqtt_config.port);
         }
     }
 }
@@ -733,6 +760,14 @@ void showHelp(void) {
 "--write-json-every <t>   Write json output every t seconds (default 1)\n"
 "--json-location-accuracy <n>  Accuracy of receiver location in json metadata: 0=no location, 1=approximate, 2=exact\n"
 "--dcfilter               Apply a 1Hz DC filter to input data (requires lots more CPU)\n"
+"--mqtt                   Enable MQTT output\n"
+"--mqtt-host <host>       MQTT broker host (default: localhost)\n"
+"--mqtt-port <port>       MQTT broker port (default: 1883)\n"
+"--mqtt-user <username>   MQTT username (optional)\n"
+"--mqtt-password <pass>   MQTT password (optional)\n"
+"--mqtt-topic <topic>     MQTT topic (default: adsb/raw)\n"
+"--mqtt-tls               Enable TLS for MQTT connection\n"
+"--mqtt-ca-cert <file>    Path to CA certificate file for TLS\n"
 "--help                   Show this help\n"
 "\n"
 "Debug mode flags: d = Log frames decoded with errors\n"
@@ -1111,12 +1146,66 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[j], "--json-location-accuracy") && more) {
             Modes.json_location_accuracy = atoi(argv[++j]);
 #endif
+        } else if (!strcmp(argv[j],"-M") || !strcmp(argv[j],"--mqtt")) {
+            Modes.mqtt_config.enabled = 1;
+        } else if ((!strcmp(argv[j],"-H") || !strcmp(argv[j],"--mqtt-host")) && more) {
+            strncpy(Modes.mqtt_config.host, argv[++j], sizeof(Modes.mqtt_config.host) - 1);
+            Modes.mqtt_config.host[sizeof(Modes.mqtt_config.host) - 1] = '\0';
+        } else if ((!strcmp(argv[j],"-P") || !strcmp(argv[j],"--mqtt-port")) && more) {
+            Modes.mqtt_config.port = atoi(argv[++j]);
+        } else if ((!strcmp(argv[j],"-U") || !strcmp(argv[j],"--mqtt-user")) && more) {
+            strncpy(Modes.mqtt_config.username, argv[++j], sizeof(Modes.mqtt_config.username) - 1);
+            Modes.mqtt_config.username[sizeof(Modes.mqtt_config.username) - 1] = '\0';
+        } else if ((!strcmp(argv[j],"-W") || !strcmp(argv[j],"--mqtt-password")) && more) {
+            strncpy(Modes.mqtt_config.password, argv[++j], sizeof(Modes.mqtt_config.password) - 1);
+            Modes.mqtt_config.password[sizeof(Modes.mqtt_config.password) - 1] = '\0';
+        } else if ((!strcmp(argv[j],"-O") || !strcmp(argv[j],"--mqtt-topic")) && more) {
+            strncpy(Modes.mqtt_config.topic, argv[++j], sizeof(Modes.mqtt_config.topic) - 1);
+            Modes.mqtt_config.topic[sizeof(Modes.mqtt_config.topic) - 1] = '\0';
+        } else if (!strcmp(argv[j],"-L") || !strcmp(argv[j],"--mqtt-tls")) {
+            Modes.mqtt_config.use_tls = 1;
+        } else if ((!strcmp(argv[j],"-C") || !strcmp(argv[j],"--mqtt-ca-cert")) && more) {
+            strncpy(Modes.mqtt_config.ca_cert, argv[++j], sizeof(Modes.mqtt_config.ca_cert) - 1);
+            Modes.mqtt_config.ca_cert[sizeof(Modes.mqtt_config.ca_cert) - 1] = '\0';
         } else {
             fprintf(stderr,
                 "Unknown or not enough arguments for option '%s'.\n\n",
                 argv[j]);
             showHelp();
             exit(1);
+        }
+    }
+    
+        // Check for environment variables for MQTT if not set by command line
+    if (Modes.mqtt_config.enabled) {
+        char *env;
+        
+        if ((env = getenv("MQTT_HOST")) != NULL && Modes.mqtt_config.host[0] == '\0') {
+            strncpy(Modes.mqtt_config.host, env, sizeof(Modes.mqtt_config.host) - 1);
+            Modes.mqtt_config.host[sizeof(Modes.mqtt_config.host) - 1] = '\0';
+        }
+        
+        if ((env = getenv("MQTT_PORT")) != NULL && Modes.mqtt_config.port == 1883) {
+            Modes.mqtt_config.port = atoi(env);
+        }
+        
+        if ((env = getenv("MQTT_USER")) != NULL && Modes.mqtt_config.username[0] == '\0') {
+            strncpy(Modes.mqtt_config.username, env, sizeof(Modes.mqtt_config.username) - 1);
+            Modes.mqtt_config.username[sizeof(Modes.mqtt_config.username) - 1] = '\0';
+        }
+        
+        if ((env = getenv("MQTT_PASSWORD")) != NULL && Modes.mqtt_config.password[0] == '\0') {
+            strncpy(Modes.mqtt_config.password, env, sizeof(Modes.mqtt_config.password) - 1);
+            Modes.mqtt_config.password[sizeof(Modes.mqtt_config.password) - 1] = '\0';
+        }
+        
+        if ((env = getenv("MQTT_TLS")) != NULL && !Modes.mqtt_config.use_tls) {
+            Modes.mqtt_config.use_tls = (atoi(env) != 0 || strcasecmp(env, "true") == 0);
+        }
+        
+        if ((env = getenv("MQTT_CA_CERT")) != NULL && Modes.mqtt_config.ca_cert[0] == '\0') {
+            strncpy(Modes.mqtt_config.ca_cert, env, sizeof(Modes.mqtt_config.ca_cert) - 1);
+            Modes.mqtt_config.ca_cert[sizeof(Modes.mqtt_config.ca_cert) - 1] = '\0';
         }
     }
 
@@ -1273,6 +1362,10 @@ int main(int argc, char **argv) {
 
     cleanup_converter(Modes.converter_state);
     log_with_timestamp("Normal exit.");
+
+    if (Modes.mqtt_config.enabled) {
+        mqtt_cleanup();
+    }
 
 #ifndef _WIN32
     pthread_exit(0);

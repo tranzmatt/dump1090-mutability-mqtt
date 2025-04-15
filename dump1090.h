@@ -250,6 +250,8 @@ typedef enum {
 #include "icao_filter.h"
 #include "convert.h"
 
+#include "mqtt.h"
+
 //======================== structure declarations =========================
 
 // Structure representing one magnitude buffer
@@ -263,7 +265,7 @@ struct mag_buf {
 };
 
 // Program global state
-struct {                             // Internal state
+typedef struct {                             // Internal state
     pthread_t       reader_thread;
 
     pthread_mutex_t data_mutex;      // Mutex to synchronize buffer access
@@ -378,7 +380,11 @@ struct {                             // Internal state
     int stats_latest_1min;
     struct stats stats_5min;
     struct stats stats_15min;
-} Modes;
+
+    mqtt_config_t mqtt_config;  // MQTT configuration
+} modes_s;
+
+extern modes_s Modes;
 
 // The struct we use to store information about a decoded message.
 struct modesMessage {

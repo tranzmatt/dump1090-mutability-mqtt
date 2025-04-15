@@ -50,6 +50,8 @@
 
 #include "dump1090.h"
 
+#include "mqtt.h"
+
 /* for PRIX64 */
 #include <inttypes.h>
 
@@ -1803,6 +1805,11 @@ void useModesMessage(struct modesMessage *mm) {
     // In non-interactive non-quiet mode, display messages on standard output
     if (!Modes.interactive && !Modes.quiet && (!Modes.show_only || mm->addr == Modes.show_only)) {
         displayModesMessage(mm);
+    }
+
+    // Publish to MQTT if enabled
+    if (Modes.mqtt_config.enabled) {
+        mqtt_publish_adsb_message(mm);
     }
 
     // Feed output clients.
