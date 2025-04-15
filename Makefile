@@ -16,8 +16,8 @@ endif
 
 CPPFLAGS+=-DMODES_DUMP1090_VERSION=\"$(DUMP1090_VERSION)\"
 CFLAGS+=-O2 -g -Wall -Werror -W
-LIBS=-lpthread -lm
-LIBS_RTL=`pkg-config --libs librtlsdr libusb-1.0`
+LIBS=-lpthread -lm 
+LIBS_RTL=`pkg-config --libs librtlsdr libusb-1.0 libmosquitto`
 CC=gcc
 
 UNAME := $(shell uname)
