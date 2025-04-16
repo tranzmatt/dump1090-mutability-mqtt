@@ -142,15 +142,28 @@ int mqtt_publish(const char *message) {
 void mqtt_publish_adsb_message(struct modesMessage *mm) {
     char message[4096]; // Larger buffer size for comprehensive data
     int len = 0;
+    struct timespec ts;
 
     // Skip if MQTT is not enabled or if mosq client is not initialized
     if (!current_config.enabled || !mosq)
         return;
+
+    // Get current system time with microsecond precision
+    clock_gettime(CLOCK_REALTIME, &ts);
+
     // Start the JSON message
     len += sprintf(message + len, "{");
 
+    // Add system timestamp (when we detected the message)
+    len += sprintf(message + len, "\"system_time\":%llu.%06lu,",
+                 (unsigned long long)ts.tv_sec, (unsigned long)ts.tv_nsec / 1000);
+
+    // Add operational timestamp from the message (when the SDR received it)
+    len += sprintf(message + len, "\"operational_time\":%llu.%02lu,",
+                 (unsigned long long)mm->sysTimestampMsg.tv_sec,
+                 (unsigned long)mm->sysTimestampMsg.tv_nsec / 10000000);
+
     // Basic message information
-    len += sprintf(message + len, "\"timestamp\":%llu,", (unsigned long long)mm->sysTimestampMsg.tv_sec);
     len += sprintf(message + len, "\"icao\":\"%06x\",", mm->addr);
     len += sprintf(message + len, "\"addrtype\":\"%s\",", addrtype_to_string(mm->addrtype));
 
