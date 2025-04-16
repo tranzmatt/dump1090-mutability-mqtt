@@ -1807,7 +1807,6 @@ void useModesMessage(struct modesMessage *mm) {
         displayModesMessage(mm);
     }
 
-    printf("\nModes.mqtt_config.enabled = %d\n",Modes.mqtt_config.enabled);
     // Publish to MQTT if enabled
     if (Modes.mqtt_config.enabled) {
         mqtt_publish_adsb_message(mm);
