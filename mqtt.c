@@ -1,6 +1,16 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <mosquitto.h>
 #include <unistd.h>  // For access() function
 
@@ -36,6 +46,148 @@ static const char *addrtype_to_string(int addrtype) {
         case ADDR_TISB_TRACKFILE: return "tisb_track";
         default: return "unknown";
     }
+}
+
+// Get the interface name used by the default route
+char* get_default_route_interface() {
+    static char iface[IFNAMSIZ] = {0};
+    FILE *fp;
+    char line[256], *p, *c;
+
+    // Try to read the default route from /proc/net/route
+    fp = fopen("/proc/net/route", "r");
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    // Skip the header line
+    if (fgets(line, sizeof(line), fp) == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+
+    // Find the line with the default route (destination 0.0.0.0)
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        p = strtok(line, "\t");
+        if (p == NULL) continue;
+
+        // Save the interface name
+        strncpy(iface, p, sizeof(iface) - 1);
+
+        // Check if this is the default route
+        c = strtok(NULL, "\t");
+        if (c == NULL) continue;
+
+        if (strcmp(c, "00000000") == 0) {  // 0.0.0.0 in hex
+            fclose(fp);
+            return iface;
+        }
+    }
+
+    fclose(fp);
+
+    // If we get here, no default route was found
+    // Try running "route -n" as a fallback
+    fp = popen("route -n | grep '^0\\.0\\.0\\.0' | tr -s ' ' | cut -d' ' -f8", "r");
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    if (fgets(iface, sizeof(iface), fp) != NULL) {
+        // Remove trailing newline if present
+        size_t len = strlen(iface);
+        if (len > 0 && iface[len - 1] == '\n') {
+            iface[len - 1] = '\0';
+        }
+
+        pclose(fp);
+        return iface;
+    }
+
+    pclose(fp);
+    return NULL;
+}
+
+// Get MAC address for the specified interface
+int get_mac_address(const char *ifname, char *mac_buf, size_t mac_buf_size) {
+    if (!ifname || !mac_buf || mac_buf_size < 13) return 0;
+
+    struct ifreq ifr;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        return 0;
+    }
+
+    unsigned char *mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+
+    // Format the MAC address (without colons)
+    snprintf(mac_buf, mac_buf_size, "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    close(fd);
+    return 1;
+}
+
+// Get device name using hostname and MAC from default route interface
+void get_device_name(char *device_name, size_t size) {
+    // First try to get device name from environment variable
+    char *env_device_name = getenv("DEVICE_NAME");
+    if (env_device_name != NULL) {
+        strncpy(device_name, env_device_name, size - 1);
+        device_name[size - 1] = '\0';
+        return;
+    }
+
+    // Get hostname
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        strcpy(hostname, "unknown");
+    }
+
+    // Get the interface used by the default route
+    char *default_iface = get_default_route_interface();
+    if (default_iface) {
+        char mac_address[13] = {0};  // 12 hex chars + null
+
+        if (get_mac_address(default_iface, mac_address, sizeof(mac_address))) {
+            // Combine hostname and MAC address
+            snprintf(device_name, size, "%s-%s", hostname, mac_address);
+            return;
+        }
+    }
+
+    // Fallback - try all non-loopback interfaces
+    struct ifaddrs *ifaddrs;
+    if (getifaddrs(&ifaddrs) == 0) {
+        for (struct ifaddrs *ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL)
+                continue;
+
+            // Skip loopback interfaces
+            if (!(ifa->ifa_flags & IFF_LOOPBACK)) {
+                char mac_address[13] = {0};  // 12 hex chars + null
+
+                if (get_mac_address(ifa->ifa_name, mac_address, sizeof(mac_address))) {
+                    // Combine hostname and MAC address
+                    snprintf(device_name, size, "%s-%s", hostname, mac_address);
+                    freeifaddrs(ifaddrs);
+                    return;
+                }
+            }
+        }
+
+        freeifaddrs(ifaddrs);
+    }
+
+    // If all else fails, just use the hostname
+    strncpy(device_name, hostname, size - 1);
+    device_name[size - 1] = '\0';
 }
 
 // Initialize MQTT connection
@@ -138,10 +290,16 @@ int mqtt_publish(const char *message) {
     return 0;
 }
 
-// Format and publish an ADS-B message to MQTT with detailed information
+
+
+// Format and publish an ADS-B message to MQTT with enhanced information
 void mqtt_publish_adsb_message(struct modesMessage *mm) {
-    char message[4096]; // Larger buffer size for comprehensive data
+    char message[8192]; // Increased buffer size for comprehensive data
+    char inner_json[4096]; // Buffer for the ADS-B JSON part
+    char device_name[256] = {0}; // Buffer for device name
+    char iso8601_time[64]; // Buffer for ISO 8601 timestamp
     int len = 0;
+    int inner_len = 0;
     struct timespec ts;
 
     // Skip if MQTT is not enabled or if mosq client is not initialized
@@ -151,212 +309,186 @@ void mqtt_publish_adsb_message(struct modesMessage *mm) {
     // Get current system time with microsecond precision
     clock_gettime(CLOCK_REALTIME, &ts);
 
-    // Start the JSON message
-    len += sprintf(message + len, "{");
+    // Format the timestamp as ISO 8601 with microsecond precision
+    struct tm *tm_info = gmtime(&ts.tv_sec);
+    strftime(iso8601_time, sizeof(iso8601_time), "%Y-%m-%dT%H:%M:%S", tm_info);
+    sprintf(iso8601_time + strlen(iso8601_time), ".%06ldZ", ts.tv_nsec / 1000);
 
-    // Add system timestamp (when we detected the message)
-    len += sprintf(message + len, "\"system_time\":%llu.%06lu,",
-                 (unsigned long long)ts.tv_sec, (unsigned long)ts.tv_nsec / 1000);
+    // Get device name - now using our improved function
+    get_device_name(device_name, sizeof(device_name));
 
-    // Add operational timestamp from the message (when the SDR received it)
-    len += sprintf(message + len, "\"operational_time\":%llu.%02lu,",
-                 (unsigned long long)mm->sysTimestampMsg.tv_sec,
-                 (unsigned long)mm->sysTimestampMsg.tv_nsec / 10000000);
+    // Start the inner JSON with ADS-B data
+    inner_len += sprintf(inner_json + inner_len, "{");
 
-    // Basic message information
-    len += sprintf(message + len, "\"icao\":\"%06x\",", mm->addr);
-    len += sprintf(message + len, "\"addrtype\":\"%s\",", addrtype_to_string(mm->addrtype));
+    // Add basic message information
+    inner_len += sprintf(inner_json + inner_len, "\"icao\":\"%06x\",", mm->addr);
+    inner_len += sprintf(inner_json + inner_len, "\"addrtype\":\"%s\",", addrtype_to_string(mm->addrtype));
 
     // Add raw message hex
-    len += sprintf(message + len, "\"raw\":\"");
+    inner_len += sprintf(inner_json + inner_len, "\"raw\":\"");
     for (int i = 0; i < (mm->msgbits + 7) / 8; i++) {
-        len += sprintf(message + len, "%02x", mm->msg[i]);
+        inner_len += sprintf(inner_json + inner_len, "%02x", mm->msg[i]);
     }
-    len += sprintf(message + len, "\",");
+    inner_len += sprintf(inner_json + inner_len, "\",");
 
     // Message details
-    len += sprintf(message + len, "\"df\":%d,", mm->msgtype);
-    len += sprintf(message + len, "\"ca\":%d,", mm->CA);
+    inner_len += sprintf(inner_json + inner_len, "\"df\":%d,", mm->msgtype);
+    inner_len += sprintf(inner_json + inner_len, "\"ca\":%d,", mm->CA);
+
+    // Add CRC information
+    inner_len += sprintf(inner_json + inner_len, "\"crc\":\"%06x\",", mm->crc);
+
+    // Add corrected bits if any
+    if (mm->correctedbits > 0) {
+        inner_len += sprintf(inner_json + inner_len, "\"correctedbits\":%d,", mm->correctedbits);
+    }
 
     // Message type information based on DF17/18 ME type
     if (mm->msgtype == 17 || mm->msgtype == 18) {
-        len += sprintf(message + len, "\"metype\":%d,", mm->metype);
+        inner_len += sprintf(inner_json + inner_len, "\"metype\":%d,", mm->metype);
         if (mm->mesub > 0) {
-            len += sprintf(message + len, "\"mesub\":%d,", mm->mesub);
-        }
-
-        // Decode ME type to human-readable format
-        switch(mm->metype) {
-            case 1: // Identification
-                len += sprintf(message + len, "\"message_type\":\"Aircraft identification\",");
-                break;
-            case 2: // Surface position
-                len += sprintf(message + len, "\"message_type\":\"Surface position\",");
-                break;
-            case 3: // Airborne position (barometric altitude)
-                len += sprintf(message + len, "\"message_type\":\"Airborne position (barometric altitude)\",");
-                break;
-            case 4: // Airborne position (GNSS altitude)
-                len += sprintf(message + len, "\"message_type\":\"Airborne position (GNSS altitude)\",");
-                break;
-            case 5: // Surface position (high precision)
-                len += sprintf(message + len, "\"message_type\":\"Surface position (high precision)\",");
-                break;
-            case 19: // Airborne velocity
-                len += sprintf(message + len, "\"message_type\":\"Airborne velocity\",");
-                break;
-            case 28: // Aircraft status
-                len += sprintf(message + len, "\"message_type\":\"Aircraft status\",");
-                break;
-            case 29: // Target state and status information
-                len += sprintf(message + len, "\"message_type\":\"Target state and status\",");
-                if (mm->mesub == 1) {
-                    len += sprintf(message + len, "\"message_subtype\":\"Target state and status (V2)\",");
-                }
-                break;
-            case 31: // Aircraft operation status
-                len += sprintf(message + len, "\"message_type\":\"Aircraft operation status\",");
-                break;
-            default:
-                len += sprintf(message + len, "\"message_type\":\"Unknown (%d)\",", mm->metype);
-                break;
+            inner_len += sprintf(inner_json + inner_len, "\"mesub\":%d,", mm->mesub);
         }
     }
 
     // Signal quality information
-    len += sprintf(message + len, "\"crc\":\"%06x\",", mm->crc);
-    len += sprintf(message + len, "\"rssi\":%.1f,", 10 * log10(mm->signalLevel * MAX_POWER));
+    inner_len += sprintf(inner_json + inner_len, "\"rssi\":%.1f,", 10 * log10(mm->signalLevel * MAX_POWER));
     if (mm->score > 0) {
-        len += sprintf(message + len, "\"score\":%d,", mm->score);
+        inner_len += sprintf(inner_json + inner_len, "\"score\":%d,", mm->score);
     }
-    if (mm->correctedbits > 0) {
-        len += sprintf(message + len, "\"correctedbits\":%d,", mm->correctedbits);
-    }
+
+    // Add operational timestamp from the message (when the SDR received it)
+    inner_len += sprintf(inner_json + inner_len, "\"operational_time\":%llu.%02lu,",
+                 (unsigned long long)mm->sysTimestampMsg.tv_sec,
+                 (unsigned long)mm->sysTimestampMsg.tv_nsec / 10000000);
 
     // Source information
     switch(mm->source) {
         case SOURCE_ADSB:
-            len += sprintf(message + len, "\"source\":\"adsb\",");
+            inner_len += sprintf(inner_json + inner_len, "\"source\":\"adsb\",");
             break;
         case SOURCE_MLAT:
-            len += sprintf(message + len, "\"source\":\"mlat\",");
+            inner_len += sprintf(inner_json + inner_len, "\"source\":\"mlat\",");
             break;
         case SOURCE_MODE_S:
-            len += sprintf(message + len, "\"source\":\"mode_s\",");
+            inner_len += sprintf(inner_json + inner_len, "\"source\":\"mode_s\",");
             break;
         case SOURCE_MODE_S_CHECKED:
-            len += sprintf(message + len, "\"source\":\"mode_s_checked\",");
+            inner_len += sprintf(inner_json + inner_len, "\"source\":\"mode_s_checked\",");
             break;
         case SOURCE_TISB:
-            len += sprintf(message + len, "\"source\":\"tisb\",");
+            inner_len += sprintf(inner_json + inner_len, "\"source\":\"tisb\",");
             break;
         default:
-            len += sprintf(message + len, "\"source\":\"unknown\",");
+            inner_len += sprintf(inner_json + inner_len, "\"source\":\"unknown\",");
     }
 
     // Air/Ground state
     switch(mm->airground) {
         case AG_GROUND:
-            len += sprintf(message + len, "\"airground\":\"ground\",");
+            inner_len += sprintf(inner_json + inner_len, "\"airground\":\"ground\",");
             break;
         case AG_AIRBORNE:
-            len += sprintf(message + len, "\"airground\":\"airborne\",");
+            inner_len += sprintf(inner_json + inner_len, "\"airground\":\"airborne\",");
             break;
         case AG_UNCERTAIN:
-            len += sprintf(message + len, "\"airground\":\"uncertain\",");
+            inner_len += sprintf(inner_json + inner_len, "\"airground\":\"uncertain\",");
             break;
         default:
-            len += sprintf(message + len, "\"airground\":\"invalid\",");
+            inner_len += sprintf(inner_json + inner_len, "\"airground\":\"invalid\",");
     }
 
     // Altitude information
     if (mm->altitude_valid) {
-        len += sprintf(message + len, "\"altitude\":%d,", mm->altitude);
+        inner_len += sprintf(inner_json + inner_len, "\"altitude\":%d,", mm->altitude);
+
         // Add altitude source
         if (mm->altitude_source == ALTITUDE_BARO) {
-            len += sprintf(message + len, "\"altitude_source\":\"barometric\",");
+            inner_len += sprintf(inner_json + inner_len, "\"altitude_source\":\"barometric\",");
         } else if (mm->altitude_source == ALTITUDE_GNSS) {
-            len += sprintf(message + len, "\"altitude_source\":\"gnss\",");
+            inner_len += sprintf(inner_json + inner_len, "\"altitude_source\":\"gnss\",");
         }
 
         // Add altitude units
         if (mm->altitude_unit == UNIT_FEET) {
-            len += sprintf(message + len, "\"altitude_unit\":\"feet\",");
+            inner_len += sprintf(inner_json + inner_len, "\"altitude_unit\":\"feet\",");
         } else {
-            len += sprintf(message + len, "\"altitude_unit\":\"meters\",");
+            inner_len += sprintf(inner_json + inner_len, "\"altitude_unit\":\"meters\",");
         }
     }
 
     // GNSS/Baro delta if available
     if (mm->gnss_delta_valid) {
-        len += sprintf(message + len, "\"gnss_delta\":%d,", mm->gnss_delta);
+        inner_len += sprintf(inner_json + inner_len, "\"gnss_delta\":%d,", mm->gnss_delta);
     }
 
     // Speed information
     if (mm->speed_valid) {
-        len += sprintf(message + len, "\"speed\":%d,", mm->speed);
+        inner_len += sprintf(inner_json + inner_len, "\"speed\":%d,", mm->speed);
+
         // Add speed source
         switch(mm->speed_source) {
             case SPEED_GROUNDSPEED:
-                len += sprintf(message + len, "\"speed_source\":\"groundspeed\",");
+                inner_len += sprintf(inner_json + inner_len, "\"speed_source\":\"groundspeed\",");
                 break;
             case SPEED_IAS:
-                len += sprintf(message + len, "\"speed_source\":\"ias\",");
+                inner_len += sprintf(inner_json + inner_len, "\"speed_source\":\"ias\",");
                 break;
             case SPEED_TAS:
-                len += sprintf(message + len, "\"speed_source\":\"tas\",");
+                inner_len += sprintf(inner_json + inner_len, "\"speed_source\":\"tas\",");
                 break;
         }
     }
 
     // Heading information
     if (mm->heading_valid) {
-        len += sprintf(message + len, "\"heading\":%d,", mm->heading);
+        inner_len += sprintf(inner_json + inner_len, "\"heading\":%d,", mm->heading);
+
         // Add heading source
         if (mm->heading_source == HEADING_TRUE) {
-            len += sprintf(message + len, "\"heading_source\":\"true\",");
+            inner_len += sprintf(inner_json + inner_len, "\"heading_source\":\"true\",");
         } else if (mm->heading_source == HEADING_MAGNETIC) {
-            len += sprintf(message + len, "\"heading_source\":\"magnetic\",");
+            inner_len += sprintf(inner_json + inner_len, "\"heading_source\":\"magnetic\",");
         }
     }
 
     // Vertical rate information
     if (mm->vert_rate_valid) {
-        len += sprintf(message + len, "\"vert_rate\":%d,", mm->vert_rate);
+        inner_len += sprintf(inner_json + inner_len, "\"vert_rate\":%d,", mm->vert_rate);
 
         // Add vertical rate source
         if (mm->vert_rate_source == ALTITUDE_BARO) {
-            len += sprintf(message + len, "\"vert_rate_source\":\"barometric\",");
+            inner_len += sprintf(inner_json + inner_len, "\"vert_rate_source\":\"barometric\",");
         } else if (mm->vert_rate_source == ALTITUDE_GNSS) {
-            len += sprintf(message + len, "\"vert_rate_source\":\"gnss\",");
+            inner_len += sprintf(inner_json + inner_len, "\"vert_rate_source\":\"gnss\",");
         }
     }
 
-    // Position information
+    // Position information (decoded)
     if (mm->cpr_decoded) {
-        len += sprintf(message + len, "\"lat\":%.6f,\"lon\":%.6f,", mm->decoded_lat, mm->decoded_lon);
+        inner_len += sprintf(inner_json + inner_len, "\"lat\":%.6f,\"lon\":%.6f,", mm->decoded_lat, mm->decoded_lon);
     }
 
     // Add raw CPR data
     if (mm->cpr_valid) {
-        len += sprintf(message + len, "\"cpr_lat\":%u,\"cpr_lon\":%u,", mm->cpr_lat, mm->cpr_lon);
-        len += sprintf(message + len, "\"cpr_odd\":%s,", mm->cpr_odd ? "true" : "false");
+        inner_len += sprintf(inner_json + inner_len, "\"cpr_lat\":%u,\"cpr_lon\":%u,", mm->cpr_lat, mm->cpr_lon);
+        inner_len += sprintf(inner_json + inner_len, "\"cpr_odd\":%s,", mm->cpr_odd ? "true" : "false");
 
         // Add CPR type
         switch(mm->cpr_type) {
             case CPR_SURFACE:
-                len += sprintf(message + len, "\"cpr_type\":\"surface\",");
+                inner_len += sprintf(inner_json + inner_len, "\"cpr_type\":\"surface\",");
                 break;
             case CPR_AIRBORNE:
-                len += sprintf(message + len, "\"cpr_type\":\"airborne\",");
+                inner_len += sprintf(inner_json + inner_len, "\"cpr_type\":\"airborne\",");
                 break;
             case CPR_COARSE:
-                len += sprintf(message + len, "\"cpr_type\":\"coarse\",");
+                inner_len += sprintf(inner_json + inner_len, "\"cpr_type\":\"coarse\",");
                 break;
         }
 
         // Add NUCp/NIC value
-        len += sprintf(message + len, "\"cpr_nucp\":%u,", mm->cpr_nucp);
+        inner_len += sprintf(inner_json + inner_len, "\"cpr_nucp\":%u,", mm->cpr_nucp);
     }
 
     // Aircraft identification
@@ -369,156 +501,163 @@ void mqtt_publish_adsb_message(struct modesMessage *mm) {
         while (last >= 0 && trimmed_callsign[last] == ' ') {
             trimmed_callsign[last--] = '\0';
         }
-        len += sprintf(message + len, "\"callsign\":\"%s\",", trimmed_callsign);
+        inner_len += sprintf(inner_json + inner_len, "\"callsign\":\"%s\",", trimmed_callsign);
     }
 
     // Transponder information
     if (mm->squawk_valid) {
-        len += sprintf(message + len, "\"squawk\":\"%04x\",", mm->squawk);
+        inner_len += sprintf(inner_json + inner_len, "\"squawk\":\"%04x\",", mm->squawk);
     }
 
     // SPI flag
     if (mm->spi_valid) {
-        len += sprintf(message + len, "\"spi\":%s,", mm->spi ? "true" : "false");
+        inner_len += sprintf(inner_json + inner_len, "\"spi\":%s,", mm->spi ? "true" : "false");
     }
 
     // Alert flag
     if (mm->alert_valid) {
-        len += sprintf(message + len, "\"alert\":%s,", mm->alert ? "true" : "false");
+        inner_len += sprintf(inner_json + inner_len, "\"alert\":%s,", mm->alert ? "true" : "false");
     }
 
     // Category information
     if (mm->category_valid) {
-        len += sprintf(message + len, "\"category\":\"%02x\",", mm->category);
+        inner_len += sprintf(inner_json + inner_len, "\"category\":\"%02x\",", mm->category);
     }
 
     // Target State & Status information (for ADS-B V2)
     if (mm->tss.valid) {
-        len += sprintf(message + len, "\"tss\":{");
+        inner_len += sprintf(inner_json + inner_len, "\"tss\":{");
 
         if (mm->tss.altitude_valid) {
-            len += sprintf(message + len, "\"altitude_type\":\"%s\",",
+            inner_len += sprintf(inner_json + inner_len, "\"altitude_type\":\"%s\",",
                          mm->tss.altitude_type == TSS_ALTITUDE_MCP ? "MCP" : "FMS");
-            len += sprintf(message + len, "\"altitude\":%d,", mm->tss.altitude);
+            inner_len += sprintf(inner_json + inner_len, "\"altitude\":%d,", mm->tss.altitude);
         }
 
         if (mm->tss.baro_valid) {
-            len += sprintf(message + len, "\"baro\":%.1f,", mm->tss.baro);
+            inner_len += sprintf(inner_json + inner_len, "\"baro\":%.1f,", mm->tss.baro);
         }
 
         if (mm->tss.heading_valid) {
-            len += sprintf(message + len, "\"heading\":%d,", mm->tss.heading);
+            inner_len += sprintf(inner_json + inner_len, "\"heading\":%d,", mm->tss.heading);
         }
 
         if (mm->tss.mode_valid) {
-            len += sprintf(message + len, "\"mode_autopilot\":%s,",
+            inner_len += sprintf(inner_json + inner_len, "\"mode_autopilot\":%s,",
                          mm->tss.mode_autopilot ? "true" : "false");
-            len += sprintf(message + len, "\"mode_vnav\":%s,",
+            inner_len += sprintf(inner_json + inner_len, "\"mode_vnav\":%s,",
                          mm->tss.mode_vnav ? "true" : "false");
-            len += sprintf(message + len, "\"mode_alt_hold\":%s,",
+            inner_len += sprintf(inner_json + inner_len, "\"mode_alt_hold\":%s,",
                          mm->tss.mode_alt_hold ? "true" : "false");
-            len += sprintf(message + len, "\"mode_approach\":%s,",
+            inner_len += sprintf(inner_json + inner_len, "\"mode_approach\":%s,",
                          mm->tss.mode_approach ? "true" : "false");
         }
 
         if (mm->tss.acas_operational) {
-            len += sprintf(message + len, "\"acas_operational\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"acas_operational\":true,");
         }
 
-        len += sprintf(message + len, "\"nac_p\":%d,", mm->tss.nac_p);
-        len += sprintf(message + len, "\"nic_baro\":%d,", mm->tss.nic_baro);
-        len += sprintf(message + len, "\"sil\":%d,", mm->tss.sil);
-        len += sprintf(message + len, "\"sil_type\":\"%s\"",
+        inner_len += sprintf(inner_json + inner_len, "\"nac_p\":%d,", mm->tss.nac_p);
+        inner_len += sprintf(inner_json + inner_len, "\"nic_baro\":%d,", mm->tss.nic_baro);
+        inner_len += sprintf(inner_json + inner_len, "\"sil\":%d,", mm->tss.sil);
+        inner_len += sprintf(inner_json + inner_len, "\"sil_type\":\"%s\"",
                      mm->tss.sil_type == SIL_PER_HOUR ? "per_hour" : "per_sample");
 
         // Close the TSS object
-        len += sprintf(message + len, "},");
+        inner_len += sprintf(inner_json + inner_len, "},");
     }
 
     // Operational status information
     if (mm->opstatus.valid) {
-        len += sprintf(message + len, "\"opstatus\":{");
+        inner_len += sprintf(inner_json + inner_len, "\"opstatus\":{");
 
-        len += sprintf(message + len, "\"version\":%d,", mm->opstatus.version);
+        inner_len += sprintf(inner_json + inner_len, "\"version\":%d,", mm->opstatus.version);
 
         // Operational modes
         if (mm->opstatus.om_acas_ra)
-            len += sprintf(message + len, "\"acas_ra\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"acas_ra\":true,");
 
         if (mm->opstatus.om_ident)
-            len += sprintf(message + len, "\"ident\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"ident\":true,");
 
         if (mm->opstatus.om_atc)
-            len += sprintf(message + len, "\"atc\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"atc\":true,");
 
         if (mm->opstatus.om_saf)
-            len += sprintf(message + len, "\"saf\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"saf\":true,");
 
-        len += sprintf(message + len, "\"sda\":%d,", mm->opstatus.om_sda);
+        inner_len += sprintf(inner_json + inner_len, "\"sda\":%d,", mm->opstatus.om_sda);
 
         // Capability codes
         if (mm->opstatus.cc_acas)
-            len += sprintf(message + len, "\"cc_acas\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_acas\":true,");
 
         if (mm->opstatus.cc_cdti)
-            len += sprintf(message + len, "\"cc_cdti\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_cdti\":true,");
 
         if (mm->opstatus.cc_1090_in)
-            len += sprintf(message + len, "\"cc_1090_in\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_1090_in\":true,");
 
         if (mm->opstatus.cc_arv)
-            len += sprintf(message + len, "\"cc_arv\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_arv\":true,");
 
         if (mm->opstatus.cc_ts)
-            len += sprintf(message + len, "\"cc_ts\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_ts\":true,");
 
-        len += sprintf(message + len, "\"cc_tc\":%d,", mm->opstatus.cc_tc);
+        inner_len += sprintf(inner_json + inner_len, "\"cc_tc\":%d,", mm->opstatus.cc_tc);
 
         if (mm->opstatus.cc_uat_in)
-            len += sprintf(message + len, "\"cc_uat_in\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_uat_in\":true,");
 
         if (mm->opstatus.cc_poa)
-            len += sprintf(message + len, "\"cc_poa\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_poa\":true,");
 
         if (mm->opstatus.cc_b2_low)
-            len += sprintf(message + len, "\"cc_b2_low\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_b2_low\":true,");
 
-        len += sprintf(message + len, "\"cc_nac_v\":%d,", mm->opstatus.cc_nac_v);
+        inner_len += sprintf(inner_json + inner_len, "\"cc_nac_v\":%d,", mm->opstatus.cc_nac_v);
 
         if (mm->opstatus.cc_nic_supp_c)
-            len += sprintf(message + len, "\"cc_nic_supp_c\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_nic_supp_c\":true,");
 
         if (mm->opstatus.cc_lw_valid)
-            len += sprintf(message + len, "\"cc_lw_valid\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"cc_lw_valid\":true,");
 
         if (mm->opstatus.nic_supp_a)
-            len += sprintf(message + len, "\"nic_supp_a\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"nic_supp_a\":true,");
 
-        len += sprintf(message + len, "\"nac_p\":%d,", mm->opstatus.nac_p);
-        len += sprintf(message + len, "\"gva\":%d,", mm->opstatus.gva);
-        len += sprintf(message + len, "\"sil\":%d,", mm->opstatus.sil);
+        inner_len += sprintf(inner_json + inner_len, "\"nac_p\":%d,", mm->opstatus.nac_p);
+        inner_len += sprintf(inner_json + inner_len, "\"gva\":%d,", mm->opstatus.gva);
+        inner_len += sprintf(inner_json + inner_len, "\"sil\":%d,", mm->opstatus.sil);
 
         if (mm->opstatus.nic_baro)
-            len += sprintf(message + len, "\"nic_baro\":true,");
+            inner_len += sprintf(inner_json + inner_len, "\"nic_baro\":true,");
 
-        len += sprintf(message + len, "\"sil_type\":\"%s\",",
+        inner_len += sprintf(inner_json + inner_len, "\"sil_type\":\"%s\",",
                      mm->opstatus.sil_type == SIL_PER_HOUR ? "per_hour" : "per_sample");
 
-        len += sprintf(message + len, "\"track_angle\":\"%s\",",
+        inner_len += sprintf(inner_json + inner_len, "\"track_angle\":\"%s\",",
                      mm->opstatus.track_angle == ANGLE_HEADING ? "heading" : "track");
 
-        len += sprintf(message + len, "\"hrd\":\"%s\"",
+        inner_len += sprintf(inner_json + inner_len, "\"hrd\":\"%s\"",
                      mm->opstatus.hrd == HEADING_TRUE ? "true" : "magnetic");
 
         // Close the opstatus object
-        len += sprintf(message + len, "},");
+        inner_len += sprintf(inner_json + inner_len, "},");
     }
 
-    // Remove trailing comma if present
-    if (message[len-1] == ',')
-        message[len-1] = '}';
+    // Remove trailing comma from inner JSON if present
+    if (inner_json[inner_len-1] == ',')
+        inner_json[inner_len-1] = '}';
     else
-        message[len] = '}';
+        inner_json[inner_len] = '}';
+
+    // Create the outer JSON wrapper
+    len += sprintf(message + len, "{");
+    len += sprintf(message + len, "\"device\":\"%s\",", device_name);
+    len += sprintf(message + len, "\"detection_time\":\"%s\",", iso8601_time);
+    len += sprintf(message + len, "\"adsb\":%s", inner_json);
+    len += sprintf(message + len, "}");
 
     // Publish to MQTT
     mqtt_publish(message);
