@@ -167,11 +167,11 @@ void modesInitConfig(void) {
     Modes.json_location_accuracy  = 1;
     Modes.maxRange                = 1852 * 300; // 300NM default max range
     // MQTT configuration defaults
-    strcpy(Modes.mqtt_config.host, "localhost");
+    Modes.mqtt_config.host[0] = '\0';
     Modes.mqtt_config.port = 1883;
     Modes.mqtt_config.username[0] = '\0';
     Modes.mqtt_config.password[0] = '\0';
-    strcpy(Modes.mqtt_config.topic, "adsb/raw");
+    strcpy(Modes.mqtt_config.topic, "adsb/adsb_reports");
     Modes.mqtt_config.use_tls = 0;
     Modes.mqtt_config.ca_cert[0] = '\0';
 
@@ -1175,16 +1175,22 @@ int main(int argc, char **argv) {
             exit(1);
         }
     }
-    
-        // Check for environment variables for MQTT if not set by command line
+
+    // Check for environment variables for MQTT if not set by command line
     if (Modes.mqtt_config.enabled) {
         char *env;
-        
-        if ((env = getenv("MQTT_HOST")) != NULL && Modes.mqtt_config.host[0] == '\0') {
-            strncpy(Modes.mqtt_config.host, env, sizeof(Modes.mqtt_config.host) - 1);
-            Modes.mqtt_config.host[sizeof(Modes.mqtt_config.host) - 1] = '\0';
+
+	// If host wasn't set by command line or is empty, check environment
+        if ((env = getenv("MQTT_HOST")) != NULL) {
+            if (Modes.mqtt_config.host[0] == '\0') {
+                strncpy(Modes.mqtt_config.host, env, sizeof(Modes.mqtt_config.host) - 1);
+                Modes.mqtt_config.host[sizeof(Modes.mqtt_config.host) - 1] = '\0';
+            }
+        } else if (Modes.mqtt_config.host[0] == '\0') {
+            // If neither command line nor environment set the host, use the default
+            strcpy(Modes.mqtt_config.host, "localhost");
         }
-        
+
         if ((env = getenv("MQTT_PORT")) != NULL && Modes.mqtt_config.port == 1883) {
             Modes.mqtt_config.port = atoi(env);
         }
