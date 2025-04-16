@@ -973,7 +973,7 @@ int main(int argc, char **argv) {
     for (j = 1; j < argc; j++) {
         int more = j+1 < argc; // There are more arguments
 
-        if (!strcmp(argv[j],"-D") || !strcmp(argv[j],"--device-index") && more) {
+        if ((!strcmp(argv[j],"-D") || !strcmp(argv[j],"--device-index")) && more) {
             Modes.dev_name = strdup(argv[++j]);
         } else if (!strcmp(argv[j],"--gain") && more) {
             Modes.gain = (int) (atof(argv[++j])*10); // Gain is in tens of DBs
